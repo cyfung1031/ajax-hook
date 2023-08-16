@@ -239,7 +239,7 @@ function trim(str) {
 }
 
 function getEventTarget(xhr) {
-  return xhr.watcher || (xhr.watcher = document.createElement('a'));
+  return xhr.watcher || (xhr.watcher = typeof document.createDocumentFragment === 'function' ? document.createDocumentFragment() : document.createElement('a'));
 }
 
 function triggerListener(xhr, name) {
@@ -275,11 +275,21 @@ Handler[prototype] = Object.create({
     triggerListener(xhr, eventReadyStateChange);
     triggerListener(xhr, eventLoad);
     triggerListener(xhr, eventLoadEnd);
+    if (xhr.readyState === 4) {
+      if (xhr.config) xhr.config.xhr = null;
+      xhr['on' + eventReadyStateChange] = null;
+      xhr.config = null;
+    }
   },
   reject: function reject(error) {
     this.xhrProxy.status = 0;
     triggerListener(this.xhr, error.type);
     triggerListener(this.xhr, eventLoadEnd);
+    if (xhr.readyState === 4) {
+      if (xhr.config) xhr.config.xhr = null;
+      xhr['on' + eventReadyStateChange] = null;
+      xhr.config = null;
+    }
   }
 });
 
@@ -313,16 +323,46 @@ var ErrorHandler = makeHandler(function (error) {
 });
 
 function proxyAjax(proxy, win) {
-  var onRequest = proxy.onRequest,
-      onResponse = proxy.onResponse,
-      onError = proxy.onError;
+  var onConfig = proxy.onConfig,
+    onRequest = null,
+    onRequest_ = proxy.onRequest,
+    onResponse = proxy.onResponse,
+    onError = proxy.onError;
 
   function handleResponse(xhr, xhrProxy) {
     var handler = new ResponseHandler(xhr);
-    var responseType = xhrProxy.responseType;
-    var responseData = !responseType || responseType === 'text' || responseType === 'json' ? xhrProxy.responseText : xhrProxy.response;
+    var getResponseData = function () {
+      // object getter is part of ES5
+      // getter to avoid uncessary processing. only proceed if response.response is called.
+      // property 'response' is enumerable such that JSON.stringify(response) contains response
+      var responseType = xhrProxy.responseType;
+      if (!responseType || responseType === 'text') {
+        return xhrProxy.responseText;
+      }
+      // reference: https://shanabrian.com/web/html-css-js-technics/js-ie10-ie11-xhr-json-string.php
+      // reference: https://github.com/axios/axios/issues/2390
+      // json - W3C standard - xhrProxy.response = JSON object; responseText is unobtainable
+      // For details, see https://github.com/wendux/ajax-hook/issues/117
+      // IE 9, 10 & 11 - only responseText
+      if (responseType === 'json' && typeof JSON === 'object' && ((navigator || 0).userAgent || '').indexOf('Trident') !== -1) {
+        return JSON.parse(xhrProxy.responseText);
+      }
+      return xhrProxy.response;
+    }; //ie9
+    var responseData;
     var ret = {
-      response: responseData, //ie9
+      get response() {
+        if (getResponseData) {
+          responseData = getResponseData();
+          getResponseData = null;
+        }
+        return responseData;
+      },
+      set response(nv) {
+        getResponseData = null;
+        responseData = nv;
+        return true;
+      },
       status: xhrProxy.status,
       statusText: xhrProxy.statusText,
       config: xhr.config,
@@ -359,13 +399,20 @@ function proxyAjax(proxy, win) {
   }
 
   function stateChangeCallback(xhr, xhrProxy) {
-    if (xhr.readyState === 4 && xhr.status !== 0) {
-      handleResponse(xhr, xhrProxy);
-    } else if (xhr.readyState !== 4) {
-      triggerListener(xhr, eventReadyStateChange);
+    var config = xhr ? xhr.config : null;
+    if (config && xhr && config.xhr === xhr) {
+      if (xhr.readyState === 4 && xhr.status !== 0) {
+        handleResponse(xhr, xhrProxy);
+      } else if (xhr.readyState !== 4) {
+        triggerListener(xhr, eventReadyStateChange);
+      }
     }
     return true;
   }
+
+  var eventListenerFnMap = typeof WeakMap === 'function' ? function (_this) {
+    return _this.eventListenerFnMap || (_this.eventListenerFnMap = new WeakMap());
+  } : null;
 
   var _hook = (0, _xhrHook.hook)({
     onload: preventXhrProxyCallback,
@@ -384,11 +431,22 @@ function proxyAjax(proxy, win) {
       config.async = args[2];
       config.user = args[3];
       config.password = args[4];
-      config.xhr = xhr;
+      Object.defineProperty(config, 'xhr', {
+        get() {
+          return xhr; // xhr wil be set to null after xhr.readyState === XMLHttpRequest.DONE (4)
+        },
+        set(nv) {
+          if (nv === null) xhr = null;
+          return true;
+        },
+        enumerable: false,
+        configurable: true
+      });
+      // config.xhr = xhr;
       var evName = 'on' + eventReadyStateChange;
       if (!xhr[evName]) {
         xhr[evName] = function () {
-          return stateChangeCallback(xhr, _this);
+          return stateChangeCallback(this, _this);
         };
       }
 
@@ -396,6 +454,10 @@ function proxyAjax(proxy, win) {
       // 所以我们在send拦截函数中再手动调用open，因此返回true阻止xhr.open调用。
       //
       // 如果没有请求拦截器，则不用阻断xhr.open调用
+      onRequest = onRequest_;
+      if (onConfig) {
+        if (onConfig(config, this) === false) onRequest = null;
+      }
       if (onRequest) return true;
     },
     send: function send(args, xhr) {
@@ -419,16 +481,35 @@ function proxyAjax(proxy, win) {
       if (onRequest) return true;
     },
     addEventListener: function addEventListener(args, xhr) {
+      // args = (type:string , listener: EventListener, opt: any?)
       var _this = this;
       if (_xhrHook.events.indexOf(args[0]) !== -1) {
         var handler = args[1];
-        getEventTarget(xhr).addEventListener(args[0], function (e) {
-          var event = (0, _xhrHook.configEvent)(e, _this);
-          event.type = args[0];
+        var Gn = function (e) {
+          var event = _xhrHook.configEvent(e, _this);
           event.isTrusted = true;
           handler.call(_this, event);
-        });
+        };
+        if (eventListenerFnMap) {
+          var map = eventListenerFnMap(_this);
+          map.set(handler, Gn);
+        }
+        getEventTarget(xhr).addEventListener(args[0], Gn, false);
         return true;
+      }
+    },
+    removeEventListener: function removeEventListener(args, xhr) {
+      // args = (type:string , listener: EventListener, opt: any?)
+      if (_xhrHook.events.indexOf(args[0]) !== -1) {
+        var handler = args[1];
+        if (eventListenerFnMap) {
+          var map = eventListenerFnMap(this);
+          var Gn = map.get(handler);
+          if (Gn) {
+            getEventTarget(xhr).removeEventListener(args[0], Gn, false);
+            return true;
+          }
+        }
       }
     },
     getAllResponseHeaders: function getAllResponseHeaders(_, xhr) {
